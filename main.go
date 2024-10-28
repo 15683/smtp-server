@@ -1,12 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"os"
 	"log"
 	"net"
+	"strings"
 	"time"
 
+	"github.com/emersion/go-msgauth/dkim"
 	"github.com/emersion/go-smtp"
 )
 
@@ -51,12 +59,18 @@ func (s *Session) Rcpt(to string) error {
 }
 
 func (s *Session) Data(r io.Reader) error {
-	if b, err := io.ReadAll(r); err != nil {
+	if data, err := io.ReadAll(r); err != nil {
 		return err
 	} else {
-		fmt.Println("Received message:", string(b))
+		fmt.Println("Received message:", string(data))
+    for _, recipient := range s.To {
+      if err := sendMail(s.From, recipient, data); err != nil {
+        fmt.Printf("Failed to send email to %s: %v", recipient, err)
+      } else {
+        fmt.Printf("Email sent successfully to %s", recipient)
+      }
+    }
 
-		// Тут происходит обработка письма
 		return nil
 	}
 }
@@ -80,4 +94,125 @@ func lookupMX(domain string) ([]*net.MX, error) {
 	}
 
 	return mxRecords, nil
+}
+
+func sendMail(from string, to string, data []byte) error {
+  domain := strings.Split(to, "@")[1]
+
+  mxRecords, err := lookupMX(domain)
+  if err != nil {
+    return err
+  }
+
+  for _, mx := range mxRecords {
+    host := mx.Host
+
+    for _, port := range []int{25, 587, 465} {
+      address := fmt.Sprintf("%s:%d", host, port)
+
+      var c *smtp.Client
+
+      var err error
+
+      switch port {
+      case 465:
+        //SMTP
+        tlsConfig := &tls.Config{ServerName: host}
+        conn, err := tls.Dial("tcp", address, tlsConfig)
+        if err != nil {
+          continue
+        }
+
+        c, err = smtp.NewClient(conn, host)
+
+      case 25, 587:
+        // SMTP или SMTP с STARTTLS
+        c, err = smtp.Dial(address)
+        if err != nil {
+          continue
+        }
+
+        if port = 587 {
+          if err = c.StartTLS(&tls.Config{ServerName: host}); err != nil {
+            c.Close()
+            continue
+          }
+        }
+      }
+
+      if err != nil {
+        continue
+      }
+
+      // Подписание сообщения DKIM подписью
+      var b bytes.Buffer
+      if err := dkim.Sign(&b, bytes.NewReader(data), dkimOptions); err != nil {
+        return fmt.Errorf("Failed to sign email with DKIM: %v", err)
+      }
+      signedData := b.Bytes()
+
+      // SMTP взаимодействие
+      if err = c.Mail(from); err != nil {
+        c.Close()
+        continue
+      }
+
+      if err = c.Rcpt(to); err != nil {
+        c.Close()
+        continue
+      }
+
+      w, err := c.Data()
+
+      if err != nil {
+        c.Close()
+        continue
+      }
+
+      _, err = w.Write(signedData) // Используем сообщение, подписанное DKIM
+      if err != nil {
+        c.Close()
+        continue
+      }
+      err = w.Close()
+      if err != nil {
+        c.Close()
+        continue
+      }
+      c.Quit()
+      return nil
+    }
+  }
+
+  return fmt.Errorf("Failed to send email to %s", to)
+}
+
+// Загружаем приватный DKIM ключ
+var dkimPrivateKey *rsa.PrivateKey
+
+func init() {
+  // Загружаем приватный DKIM ключ из файла
+  privateKeyPEM, err := os.ReadFile("path/to/your/private_key.pem") // заменить на реальный путь к вашему закрытому DKIM ключу
+  if err != nil {
+    log.Fatalf("Failed to read private key: %v", err)
+  }
+
+  block, _ := pem.Decode(privateKeyPEM)
+  if block == nil {
+    log.Fatalf("Failed to parse PEM block containing the private key")
+  }
+
+  privateKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+  if err != nil {
+    log.Fatalf("Failed to parse private key: %v", err)
+  }
+
+  dkimPrivateKey = privateKey
+}
+
+// DKIM опции; обновить Domain и Selector, чтобы они соответствовали вашей DNS записи для DKIM.
+var dkimOptions = &dkim.SignOptions{
+  Domain: "example.com",
+  Selector: "default",
+  Signer: dkimPrivateKey,
 }
